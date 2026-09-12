@@ -3,7 +3,9 @@
 from contextlib import redirect_stdout
 import io
 import os
+import subprocess
 import unittest
+from unittest.mock import patch
 
 import omarchyair as air
 
@@ -46,6 +48,18 @@ class DiscoverySupervisionTests(unittest.TestCase):
         code = 'import os,time; os.write(2,b"x"*16384); time.sleep(10)'
         output = self.supervise(code, "output line exceeds")
         self.assertEqual(output, "")
+
+    def test_missing_receiver_metadata_is_a_controlled_error(self):
+        def response(*command, **kwargs):
+            data = '[{"name":"raop_sink.example"}]' if command[0] == "pactl" else "{}"
+            return subprocess.CompletedProcess(command, 0, data, "")
+
+        with (
+            patch.object(air, "run", side_effect=response),
+            patch.object(air, "validate_helper", return_value=None),
+            self.assertRaises(ValueError),
+        ):
+            air.doctor()
 
 
 if __name__ == "__main__":

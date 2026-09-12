@@ -1,2 +1,7 @@
 __pycache__/
 *.py[cod]
+/src/
+/pkg/
+/*.pkg.tar.*
+/.SRCINFO
+/.ruff_cache/

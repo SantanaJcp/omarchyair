@@ -12,7 +12,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-import omarchyair as air
+import omarchyair_runtime as air
 
 
 def alive(pid):
@@ -162,9 +162,12 @@ class ProcessBoundaryTests(unittest.TestCase):
                     "python3",
                     "-I",
                     "-c",
-                    'import os; fd=os.open("/dev/tty",os.O_RDWR); '
-                    'assert os.tcgetpgrp(fd)==os.getpgrp(); print("foreground-auth")',
+                    'import os,sys; fd=os.open("/dev/tty",os.O_RDWR); '
+                    "assert os.tcgetpgrp(fd)==os.getpgrp(); "
+                    'assert sys.stdin.buffer.read()==b"bootstrap-payload"; '
+                    'print("foreground-auth")',
                     interactive=True,
+                    input_data=b"bootstrap-payload",
                     timeout=3,
                 )
                 assert result.stdout.strip() == "foreground-auth"

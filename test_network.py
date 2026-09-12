@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-import omarchyair as network
+import omarchyair_helper as network
 
 
 def rule(action="allow", logging=False, comment="user-owned"):

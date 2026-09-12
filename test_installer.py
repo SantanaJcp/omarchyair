@@ -4,12 +4,29 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
+
 from unittest.mock import patch
 
-
 import omarchyair as installer
+
+
+class InstallHost:
+    def __init__(self, *, package_present=True, avahi_running=True):
+        self.package_present = package_present
+        self.avahi_running = avahi_running
+        self.calls = []
+
+    def run(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        returncode = 0
+        if args[:3] == ("pacman", "-Q", "pipewire-zeroconf"):
+            returncode = 0 if self.package_present else 1
+        elif args[:3] == ("systemctl", "is-active", "--quiet"):
+            returncode = 0 if self.avahi_running else 1
+        return subprocess.CompletedProcess(args, returncode, "", "")
 
 
 class InstallerFilesystemTests(unittest.TestCase):
@@ -48,6 +65,59 @@ class InstallerFilesystemTests(unittest.TestCase):
                 os.close(parentfd)
         finally:
             os.close(sourcefd)
+
+    def prepare_install_source(self):
+        (self.source / "manifest.json").write_text(
+            json.dumps({"id": installer.PLUGIN_ID, "version": "0.3.0"})
+        )
+
+    def install_failure(self, host):
+        with (
+            patch.object(installer, "SOURCE", self.source),
+            patch.object(
+                installer, "_normal_user", return_value=(self.owner, self.root)
+            ),
+            patch.object(installer, "ensure_helper", return_value=None),
+            patch.object(installer, "run", side_effect=host.run),
+        ):
+            with self.assertRaises(ValueError) as failure:
+                installer.install()
+        return failure.exception
+
+    def test_missing_package_stops_before_publication_or_enablement(self):
+        self.prepare_install_source()
+        host = InstallHost(package_present=False)
+
+        failure = self.install_failure(host)
+
+        self.assertIn("pipewire-zeroconf", str(failure))
+        target = self.root / ".config" / "omarchy" / "plugins" / installer.PLUGIN_ID
+        self.assertFalse(target.exists())
+        self.assertFalse(
+            any(args[:3] == ("omarchy", "plugin", "enable") for args, _ in host.calls)
+        )
+        self.assertFalse(any(args[:2] == ("omarchy", "pkg") for args, _ in host.calls))
+        self.assertFalse(any(args and args[0] == "systemctl" for args, _ in host.calls))
+
+    def test_inactive_avahi_stops_before_publication_or_enablement(self):
+        self.prepare_install_source()
+        host = InstallHost(package_present=True, avahi_running=False)
+
+        failure = self.install_failure(host)
+
+        self.assertIn("Avahi", str(failure))
+        target = self.root / ".config" / "omarchy" / "plugins" / installer.PLUGIN_ID
+        self.assertFalse(target.exists())
+        self.assertFalse(
+            any(args[:3] == ("omarchy", "plugin", "enable") for args, _ in host.calls)
+        )
+        self.assertFalse(any(args[:2] == ("omarchy", "pkg") for args, _ in host.calls))
+        self.assertFalse(
+            any(
+                args[:2] in {("systemctl", "start"), ("systemctl", "enable")}
+                for args, _ in host.calls
+            )
+        )
 
     def test_existing_target_is_not_overwritten(self):
         target = self.plugins / installer.PLUGIN_ID
@@ -217,14 +287,14 @@ class InstallerFilesystemTests(unittest.TestCase):
                 (target / name).read_bytes(), (self.source / name).read_bytes()
             )
 
-    def test_group_writable_privileged_helper_is_rejected_before_external_execution(
+    def test_group_writable_payload_helper_is_rejected_before_external_execution(
         self,
     ):
         (self.source / "manifest.json").write_text(
             json.dumps(
                 {
                     "id": installer.PLUGIN_ID,
-                    "version": "0.2.0",
+                    "version": "0.3.0",
                 }
             )
         )

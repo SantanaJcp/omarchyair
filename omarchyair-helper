@@ -1,0 +1,123 @@
+#!/usr/bin/python3 -I
+"""Validate the trusted helper installation before importing it."""
+
+import os
+import stat
+import subprocess
+import sys
+
+
+_PACKAGE_ROOT = "/usr/lib/omarchyair"
+_HELPER_PATH = _PACKAGE_ROOT + "/omarchyair_helper.py"
+_RUNTIME_PATH = _PACKAGE_ROOT + "/omarchyair_runtime.py"
+_WRAPPER_PATH = "/usr/bin/omarchyair-helper"
+_DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+_FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+def _identity(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_uid,
+        info.st_mode & 0o7777,
+        info.st_nlink,
+    )
+
+
+def _validate_path(path, *, executable=False):
+    """Validate a fixed absolute path without following any symlink."""
+    if not path.startswith("/") or ".." in path.split("/"):
+        raise ValueError("Helper installation path is invalid.")
+    components = [component for component in path.split("/") if component]
+    if not components:
+        raise ValueError("Helper installation path is invalid.")
+    directory_fd = os.open("/", _DIRECTORY_FLAGS)
+    root = os.fstat(directory_fd)
+    if not stat.S_ISDIR(root.st_mode) or root.st_uid != 0 or root.st_mode & 0o022:
+        raise ValueError("Untrusted helper installation root.")
+    try:
+        for index, component in enumerate(components):
+            final = index == len(components) - 1
+            info = os.stat(component, dir_fd=directory_fd, follow_symlinks=False)
+            if info.st_uid != 0 or info.st_mode & 0o022:
+                raise ValueError(f"Untrusted helper installation path: {path}")
+            if final:
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError(f"Untrusted helper module: {path}")
+                if executable and not info.st_mode & 0o111:
+                    raise ValueError(f"Helper wrapper is not executable: {path}")
+                file_fd = os.open(component, _FILE_FLAGS, dir_fd=directory_fd)
+                try:
+                    checked = os.fstat(file_fd)
+                    if _identity(checked) != _identity(info):
+                        raise ValueError(
+                            f"Helper module changed while checking: {path}"
+                        )
+                    if (
+                        not stat.S_ISREG(checked.st_mode)
+                        or checked.st_uid != 0
+                        or checked.st_mode & 0o022
+                        or checked.st_nlink != 1
+                    ):
+                        raise ValueError(f"Untrusted helper module: {path}")
+                    if executable and not checked.st_mode & 0o111:
+                        raise ValueError(f"Helper wrapper is not executable: {path}")
+                finally:
+                    os.close(file_fd)
+                return
+            if not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"Untrusted helper ancestor: {path}")
+            child_fd = os.open(component, _DIRECTORY_FLAGS, dir_fd=directory_fd)
+            try:
+                checked = os.fstat(child_fd)
+                if _identity(checked) != _identity(info):
+                    raise ValueError(f"Helper ancestor changed while checking: {path}")
+                if (
+                    not stat.S_ISDIR(checked.st_mode)
+                    or checked.st_uid != 0
+                    or checked.st_mode & 0o022
+                ):
+                    raise ValueError(f"Untrusted helper ancestor: {path}")
+            except BaseException:
+                os.close(child_fd)
+                raise
+            os.close(directory_fd)
+            directory_fd = child_fd
+    finally:
+        os.close(directory_fd)
+
+
+def _validate_installation():
+    # Check the entry point as well as both modules. Do this before touching
+    # sys.path or importing either packaged Python module.
+    _validate_path(_WRAPPER_PATH, executable=True)
+    _validate_path(_HELPER_PATH)
+    _validate_path(_RUNTIME_PATH)
+
+
+def main():
+    try:
+        _validate_installation()
+        # Root operations must not leave caches outside pacman's file ownership.
+        sys.dont_write_bytecode = True
+        sys.path.insert(0, _PACKAGE_ROOT)
+        from omarchyair_helper import main as helper_main
+
+        return helper_main()
+    except KeyboardInterrupt:
+        print(
+            "omarchyair-helper: interrupted; recorded network state is retained",
+            file=sys.stderr,
+        )
+        return 130
+    except Exception as error:
+        message = str(error)
+        if isinstance(error, subprocess.CalledProcessError) and error.stderr:
+            message += ": " + error.stderr[:512]
+        print(f"omarchyair-helper: {message[:1024]}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

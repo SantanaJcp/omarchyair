@@ -8,7 +8,7 @@ Item {
   property var lastExitCode: null
   property string lastError: ""
   property bool ready: false
-  readonly property string serviceVersion: "0.2.0"
+  readonly property string serviceVersion: "0.3.0"
 
   // The isolated supervisor owns discovery and its entire process group.
   // A lost shell lease tears down the group without restarting shared audio.
@@ -18,6 +18,7 @@ Item {
       decodeURIComponent(Qt.resolvedUrl("omarchyair.py").toString().replace(/^file:\/\//, "")),
       "discover"]
     clearEnvironment: true
+    // With clearEnvironment, null inherits this one variable instead of removing it.
     environment: ({ LC_ALL: "C", WAYLAND_DISPLAY: null })
     workingDirectory: "/"
     stdinEnabled: true
