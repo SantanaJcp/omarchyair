@@ -9,35 +9,60 @@ PipeWire provides discovery, authentication, audio transport, and volume control
 
 - Omarchy with the Quickshell service-plugin API (`omarchy plugin` commands).
 - PipeWire, WirePlumber, `pipewire-pulse`, `pipewire-zeroconf`, Avahi, Python 3.
+- UFW with its packaged iptables backend for the optional network helper.
 - An AirPlay receiver that supports PipeWire's RAOP sender, on a reachable LAN.
 - An active desktop session. Run setup as your normal user, not root.
 
 ## Install
 
-Clone the repository and run the installer:
+Review the checkout before executing it, especially before granting root access:
 
 ```sh
 git clone https://github.com/SantanaJcp/omarchyair.git
 cd omarchyair
-python3 setup.py install
-python3 setup.py doctor
+/usr/bin/python3 -I omarchyair.py install
+/usr/bin/python3 -I omarchyair.py doctor
 ```
 
-The installer validates the manifest, installs `pipewire-zeroconf` if missing
-through `omarchy pkg add`, copies this plugin to
-`~/.config/omarchy/plugins/community.omarchyair`, and enables it. An existing
-installation is never overwritten. From an installed checkout, the same command
-validates dependencies and enables it without copying over itself.
+The installer validates the manifest, copies the fixed plugin payload to
+`~/.config/omarchy/plugins/community.omarchyair`, and enables it. Existing
+installations are never overwritten. Running the installed copy enables it
+without copying over itself. Python isolated mode (`-I`) is required.
 
-Alternatively, use Omarchy's native plugin manager:
+If `pipewire-zeroconf` is missing, installation requests foreground `sudo`
+authentication for the narrow `install-dependency` command. That command runs
+`omarchy pkg add pipewire-zeroconf` under a root supervisor with its own deadline;
+it accepts no package names or arbitrary commands. No dependency installation or
+privilege escalation occurs in the background service. Without an interactive
+terminal, install the dependency explicitly through Omarchy first.
+
+Alternatively, use the native plugin manager, then validate dependencies:
 
 ```sh
 omarchy plugin add https://github.com/SantanaJcp/omarchyair.git --yes
-python3 ~/.config/omarchy/plugins/community.omarchyair/setup.py install
+/usr/bin/python3 -I ~/.config/omarchy/plugins/community.omarchyair/omarchyair.py install
 ```
 
-The native plugin manager clones the repository without running its code or
-installing dependencies. Review the plugin before running its installer.
+### Upgrade from an earlier release
+
+Use a separate, reviewed checkout of the new release. Select a local audio
+output, then run:
+
+```sh
+/usr/bin/python3 -I omarchyair.py uninstall
+omarchy restart shell
+/usr/bin/python3 -I omarchyair.py install
+/usr/bin/python3 -I omarchyair.py doctor
+```
+
+The shell can retain compiled QML after a plugin rescan. A shell restart clears
+that cache; it does not restart PipeWire. Installation and diagnostics compare
+the running service's compiled version with the checkout's manifest and refuse
+to report an older cached component as healthy. The manifest and the compiled
+`Service.qml` version must both be advanced for each release.
+
+Version 0.2.0 replaces `setup.py` and `network.py` with the single isolated
+`omarchyair.py` entry point. Existing valid network journals remain usable.
 
 ## Network preparation (only when needed)
 
@@ -47,7 +72,9 @@ Check the current interface and directly connected subnet with `ip -4 route`.
 For example, **substitute your own interface and subnet**:
 
 ```sh
-sudo python3 network.py enable --interface wlan0 --subnet 192.168.1.0/24
+sudo /usr/bin/env -i PATH=/usr/bin LC_ALL=C \
+  /usr/bin/python3 -I "$PWD/omarchyair.py" network enable \
+  --interface wlan0 --subnet 192.168.1.0/24
 ```
 
 This opens only UDP 6001–6002, only on that interface, only from the specified
@@ -64,6 +91,12 @@ Additional simultaneous RAOP sessions can need higher control/timing ports;
 this helper deliberately does not open an entire port range in advance.
 IPv6-specific firewall setup is not automated.
 
+The helper checks the live kernel rule as well as UFW's persisted configuration.
+If an interrupted UFW operation leaves them inconsistent, it stops and keeps the
+reversal journal. Inspect the firewall; run `sudo ufw reload` only if the persisted
+policy is what you intend to apply, then retry. The helper never performs a
+global firewall reload automatically.
+
 ## Use
 
 1. Open Omarchy's audio panel and select the receiver by its advertised name.
@@ -79,34 +112,76 @@ latency, AirPlay 2 multiroom synchronization, or pairing support.
 
 ```sh
 omarchy-shell omarchyair status
-python3 setup.py doctor
+/usr/bin/python3 -I omarchyair.py doctor
 omarchy plugin disable community.omarchyair
 omarchy plugin enable community.omarchyair
 ```
 
-The service owns a managed `pw-cli` child. Disabling/removing the plugin or
-reloading the shell terminates that child and removes its sinks. Re-enable the
-plugin if its process exits after an audio-server failure. No restart loop hides
-errors. `status` reports process state and discovered sinks, **not proof that a
-speaker played sound**. `doctor` exits 0 only when prerequisites, discovery
-process, and at least one RAOP sink are present; it is not an auditory test.
+The service supervises a private `pw-cli` process group. It requires an explicit
+module acknowledgement before reporting `ready`, probes that module every five
+seconds, and requires a renewable lease from the shell. Disabling/removing the
+plugin or losing either lease ends discovery and removes its sinks. Healthy
+audio has no arbitrary session-duration limit.
+
+Re-enable the plugin explicitly after a backend failure; no restart loop hides
+errors. `status` reports readiness, compiled version, bounded terminal errors and
+discovered sinks, **not proof that a speaker played sound**. `doctor` exits 0
+only when dependencies, Avahi, current service version, ready discovery and at
+least one RAOP sink are present. It is not an auditory test.
 
 ## Revert
 
 First select a local output, then from the original repository:
 
 ```sh
-python3 setup.py uninstall
-sudo python3 network.py disable
+/usr/bin/python3 -I omarchyair.py uninstall
+sudo /usr/bin/env -i PATH=/usr/bin LC_ALL=C \
+  /usr/bin/python3 -I "$PWD/omarchyair.py" network disable
 ```
 
-The first command uses Omarchy's native plugin removal (manual installations
-are backed up by Omarchy). The second removes only recorded firewall rules and
-restores Avahi state only if this helper changed it. If a managed firewall rule
-was edited, removal stops for inspection rather than deleting someone else's
-rule. Shared packages are intentionally retained; they may have other users.
-No PipeWire configuration files, existing bar layout, or unrelated settings are
-replaced. To reinstall, repeat the installation and any needed LAN preparation.
+The first command removes the plugin's enabled record through native shell IPC
+and atomically moves its whole directory to a `.community.omarchyair.bak.*`
+backup. Git checkouts are also backed up: removal never recursively traverses
+or deletes the plugin tree.
+
+The second command removes only recorded firewall rules and restores Avahi
+state only if this helper changed it. Edited managed rules stop removal for
+inspection. The private network directory and lock file remain to prevent
+concurrent operations from acquiring different locks; a completed reversal
+removes `network.json`. Shared packages are intentionally retained.
+
+No PipeWire configuration files, bar layout or unrelated settings are replaced.
+To reinstall, repeat installation and any needed LAN preparation.
+
+## Security boundaries
+
+- System tools and the Python interpreter use fixed paths, with root ownership
+  and non-writable resolution components verified. Subprocess environments are
+  built from an allowlist; inherited `PATH`, Python startup variables and loader
+  overrides are not forwarded. Home comes from the account database. Desktop
+  sockets are checked under the user's private runtime directory.
+- Ordinary commands have 30-second deadlines and a combined 1 MiB live output
+  budget. Root package installation is limited to 600 seconds and 8 MiB, with a
+  660-second foreground authentication/caller budget. Guardians own process
+  groups, handle caller death, and escalate termination after a one-second
+  grace period. Interactive authentication retains the controlling terminal.
+- Discovery has a ten-second startup deadline, five-second probe responses,
+  renewable fifteen-second leases, an 8 KiB line limit and a 256 KiB/ten-second
+  backend output budget. Raw backend output is not forwarded to shell logging.
+- Root journals use verified no-follow directory descriptors, an exclusive
+  nonblocking lock, private single-link regular files, a 64 KiB read limit and
+  an allowlisted schema. Writes use random exclusive temporaries, `fsync` and
+  atomic replacement. Unsafe or substituted paths are refused, not repaired.
+- Installation verifies source/destination owners and permissions, copies only
+  bounded regular files into exclusive destinations and publishes without
+  overwriting an existing path. Cleanup removes only this transaction's files
+  while the staging directory is still unpublished.
+
+These controls assume a trusted operating system and a reviewed checkout.
+Executing this repository as root grants its code root privileges. This is not
+a sandbox against malicious same-user code, a compromised root account, or a
+compromised PipeWire/receiver implementation. No security certification or
+marketplace approval is implied.
 
 ## Compatibility and verification
 
@@ -134,17 +209,34 @@ application through the SYMFONISK Table lamp receiver. The bookshelf model
 remains hardware-unverified. A MacBook receiver was discovered but not
 playback-tested. No universal AirPlay or AirPlay 2 compatibility claim is made.
 
-Run the focused preservation regressions without root:
+Run the isolated regressions without root or audio hardware:
 
 ```sh
-python3 -m unittest -v test_network
+/usr/bin/python3 -m unittest -v test_network test_installer test_process test_discovery
 ```
 
-They cover existing firewall policy preservation, edited managed rules,
-idempotent reversal, and Avahi service/socket restoration using an isolated host
-model. They do not simulate or prove Sonos audio. Hardware acceptance additionally
-requires browser and non-browser playback, listener confirmation, local fallback,
-and real install/uninstall/reinstall checks.
+They cover firewall-policy preservation, interrupted persisted/live rule
+reconciliation, Avahi reversal, hostile filesystem entries, atomic publication
+and cleanup, poisoned environments, real process-tree termination, foreground
+TTY restoration, and discovery acknowledgement/lease failures. Firewall behavior
+uses an isolated host model; process and filesystem boundaries use real OS
+operations. These tests do not prove audible playback.
+
+Hardware acceptance additionally requires actual browser and non-browser
+playback, listener confirmation, local fallback and install/remove/reinstall
+checks. The hardware findings above belong to the stated 2026-09-11 session;
+they are not a claim of new hardware coverage for each security change.
+
+For the 0.2.0 security release, all 40 isolated regressions passed. A cold-shell
+reinstall loaded the compiled 0.2.0 service; Chrome and `paplay` streams moved to
+the Sonos sink and back to local speakers. Disabling the plugin terminated its
+supervisor, guardian and `pw-cli`; re-enabling rediscovered the receiver and
+passed `doctor`. The privileged `network enable` smoke test exited successfully,
+preserved the existing scoped UDP 6001–6002 rule and persisted its journal.
+It requested no additional ports or Avahi activation. New-rule creation,
+reversal and interrupted-operation cases were exercised in the isolated tests,
+not repeated against the live firewall for this release. No new listener
+confirmation is implied by these security-release checks.
 
 ## License
 

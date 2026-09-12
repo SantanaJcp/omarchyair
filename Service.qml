@@ -7,26 +7,45 @@ Item {
 
   property var lastExitCode: null
   property string lastError: ""
+  property bool ready: false
+  readonly property string serviceVersion: "0.2.0"
 
-  // The child owns its RAOP modules. Disabling this service removes its sinks
-  // without editing PipeWire configuration or restarting the user's audio.
+  // The isolated supervisor owns discovery and its entire process group.
+  // A lost shell lease tears down the group without restarting shared audio.
   Process {
     id: discovery
-    command: ["pw-cli", "-m", "load-module", "libpipewire-module-raop-discover",
-      '{ stream.rules = [ { matches = [ { raop.ip = "~.*" } ] actions = { create-stream = { stream.props = { priority.session = 0 } } } } ] }']
+    command: ["/usr/bin/python3", "-I",
+      decodeURIComponent(Qt.resolvedUrl("omarchyair.py").toString().replace(/^file:\/\//, "")),
+      "discover"]
+    clearEnvironment: true
+    environment: ({ LC_ALL: "C", WAYLAND_DISPLAY: null })
+    workingDirectory: "/"
+    stdinEnabled: true
     running: true
+    onStarted: discovery.write(".\n")
     stdout: SplitParser {
-      onRead: function(data) { console.log("Omarchy Air: " + data) }
-    }
-    stderr: SplitParser {
       onRead: function(data) {
-        root.lastError = data
-        console.warn("Omarchy Air: " + data)
-        // pw-cli monitor mode otherwise stays alive after a failed command.
-        if (data.indexOf("Error:") === 0) discovery.running = false
+        if (data === '{"ready":true}') root.ready = true
+        else {
+          root.lastError = "Invalid supervisor response"
+          discovery.running = false
+        }
       }
     }
-    onExited: function(exitCode) { root.lastExitCode = exitCode }
+    stderr: SplitParser {
+      onRead: function(data) { root.lastError = data.substring(0, 1024) }
+    }
+    onExited: function(exitCode) {
+      root.ready = false
+      root.lastExitCode = exitCode
+    }
+  }
+
+  Timer {
+    interval: 5000
+    repeat: true
+    running: discovery.running
+    onTriggered: discovery.write(".\n")
   }
 
   Component.onDestruction: discovery.running = false
@@ -43,7 +62,7 @@ Item {
           receivers.push({ name: node.name, description: node.description,
             selected: node === Pipewire.defaultAudioSink })
       }
-      return JSON.stringify({ running: discovery.running,
+      return JSON.stringify({ ready: discovery.running && root.ready, version: root.serviceVersion,
         lastExitCode: root.lastExitCode, lastError: root.lastError,
         receivers: receivers })
     }
