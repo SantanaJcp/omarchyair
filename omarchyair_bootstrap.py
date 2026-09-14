@@ -1,10 +1,14 @@
 #!/usr/bin/python3 -I
 """Normal-user bootstrap for the signed, root-owned Omarchy Air helper."""
 
+from contextlib import contextmanager
+import hashlib
 import json
 import os
 import re
 import stat
+import subprocess
+import sys
 import tempfile
 
 from omarchyair_runtime import fixed_executable, open_directory, read_regular, run
@@ -19,7 +23,16 @@ _PUBLIC_KEY = "signing-key.asc"
 _KEY_LIMIT = 4096
 _PROTOCOL_LIMIT = 4096
 _GPG_OUTPUT_LIMIT = 64 * 1024
-_POLICY_OUTPUT_LIMIT = 4096
+_PACKAGE_LIMIT = 1024 * 1024
+_SIGNATURE_LIMIT = 4096
+_DOWNLOAD_TIMEOUT = 60
+_CACHE_ROOT = "/var/cache"
+_RELEASE_DIGESTS = {
+    "0.3.1": (
+        "63123c19c0b3f3d5cdce04f950a30088708a8c651cb0bb0c77b038ed239b10c6",
+        "01c5c792ce7b43f8c8306b8ff4a020f25ed87712f0f0474f04eb398088a5d646",
+    ),
+}
 _PACKAGE_OUTPUT_LIMIT = 8 * 1024 * 1024
 _PROTOCOL_TIMEOUT = 30
 _PREFLIGHT_TIMEOUT = 30
@@ -43,6 +56,10 @@ def _json_object(pairs):
 
 class _UnsafeInstallation(ValueError):
     """A path in the fixed helper tree is not safe to inspect or execute."""
+
+
+class _StageCleanupError(ValueError):
+    """Staged operations completed, but their private root files remain."""
 
 
 def _validate_fingerprint(value):
@@ -282,55 +299,190 @@ def _verify_public_key(key_data, signing_fingerprint):
         )
 
 
-def _pacman_conf(name):
+def _download_asset(url, limit):
     try:
         result = run(
-            "pacman-conf",
-            name,
-            timeout=_PREFLIGHT_TIMEOUT,
-            output_limit=_POLICY_OUTPUT_LIMIT,
+            "curl",
+            "--disable",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--location",
+            "--max-redirs",
+            "3",
+            "--connect-timeout",
+            "10",
+            "--max-time",
+            str(_DOWNLOAD_TIMEOUT),
+            "--max-filesize",
+            str(limit),
+            "--fail",
+            "--silent",
+            "--show-error",
+            url,
+            timeout=_DOWNLOAD_TIMEOUT + 5,
+            output_limit=limit,
+            text=False,
         )
-    except Exception as error:
+    except subprocess.CalledProcessError as error:
+        diagnostic = (error.stderr or b"").decode("utf-8", "replace").strip()
         raise ValueError(
-            f"Could not inspect pacman {name} signature policy; "
-            "refusing to install without verified package signatures"
+            f"Helper release download failed ({error.returncode}): {diagnostic[:512]}"
         ) from error
-    return result.stdout.strip()
+    data = result.stdout
+    if not isinstance(data, bytes) or not 0 < len(data) <= limit:
+        raise ValueError("Release asset is empty or exceeds its download size limit")
+    return data
 
 
-def _remote_signature_policy():
-    output = _pacman_conf("RemoteFileSigLevel")
-    if not output:
-        # An empty RemoteFileSigLevel inherits the effective package policy.
-        output = _pacman_conf("SigLevel")
-    policy = output.replace(",", " ").split()
-    required = {"Required", "PackageRequired"} & set(policy)
-    trusted = {"TrustedOnly", "PackageTrustedOnly"} & set(policy)
-    weak = {
-        "Never",
-        "Optional",
-        "TrustAll",
-        "TrustAllSignatures",
-        "PackageNever",
-        "PackageOptional",
-        "PackageTrustAll",
-    } & set(policy)
-    if not required or not trusted:
+def _download_package(version):
+    try:
+        package_digest, signature_digest = _RELEASE_DIGESTS[version]
+    except KeyError as error:
         raise ValueError(
-            "pacman RemoteFileSigLevel must require signed, trusted packages; "
-            "set Required TrustedOnly in pacman.conf and retry"
-        )
-    if weak:
+            f"No pinned package SHA-256 for helper version {version}"
+        ) from error
+    package = _download_asset(_package_url(version), _PACKAGE_LIMIT)
+    if hashlib.sha256(package).hexdigest() != package_digest:
+        raise ValueError("Helper package SHA-256 does not match the reviewed release")
+    signature = _download_asset(_package_url(version) + ".sig", _SIGNATURE_LIMIT)
+    if hashlib.sha256(signature).hexdigest() != signature_digest:
+        raise ValueError("Helper signature SHA-256 does not match the reviewed release")
+    return package, signature
+
+
+def _verify_staged_signature(package, signature, signing_fingerprint):
+    result = _run_privileged(
+        "gpg",
+        "--no-options",
+        "--batch",
+        "--homedir",
+        "/etc/pacman.d/gnupg",
+        "--no-auto-key-retrieve",
+        "--status-fd",
+        "1",
+        "--verify",
+        signature,
+        package,
+    )
+    valid = []
+    trusted = False
+    good = 0
+    invalid = False
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 2 and fields[:2] == ["[GNUPG:]", "VALIDSIG"]:
+            valid.append(fields)
+        elif len(fields) >= 2 and fields[0] == "[GNUPG:]":
+            trusted |= fields[1] in {"TRUST_FULLY", "TRUST_ULTIMATE"}
+            good += fields[1] == "GOODSIG"
+            invalid |= fields[1] in {"EXPKEYSIG", "REVKEYSIG", "EXPSIG"}
+    if (
+        len(valid) != 1
+        or len(valid[0]) != 12
+        or valid[0][-1] != signing_fingerprint
+        or not trusted
+        or good != 1
+        or invalid
+    ):
         raise ValueError(
-            "pacman RemoteFileSigLevel is weaker than Required TrustedOnly; "
-            "strengthen pacman.conf and retry without disabling signature checks"
+            "Package signature is not from the trusted project signing key"
         )
+
+
+def _check_stage(parent, name, identity=None):
+    info = os.stat(name, dir_fd=parent, follow_symlinks=False)
+    current = (info.st_dev, info.st_ino)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or info.st_uid != 0
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or (identity is not None and identity != current)
+    ):
+        raise ValueError("Privileged package staging directory is unsafe or replaced")
+    return current
+
+
+@contextmanager
+def _staged_package(version, package, signature):
+    # Every ancestor is root-owned and nonwritable by normal users. A private,
+    # exclusively created directory keeps the copied objects stable for pacman.
+    filename = f"omarchyair-helper-{_validate_version(version)}-1-any.pkg.tar.zst"
+    parent = open_directory(_CACHE_ROOT, 0)
+    stage = None
+    identity = None
+    failed = False
+    try:
+        result = _run_privileged(
+            "mktemp",
+            "--directory",
+            f"--tmpdir={_CACHE_ROOT}",
+            "omarchyair.XXXXXXXXXXXX",
+        )
+        stage = result.stdout.strip()
+        name = os.path.basename(stage)
+        if (
+            os.path.dirname(stage) != _CACHE_ROOT
+            or re.fullmatch(r"omarchyair\.[A-Za-z0-9]{12}", name) is None
+        ):
+            raise ValueError("Invalid privileged package staging path")
+        identity = _check_stage(parent, name)
+        package_path = f"{stage}/{filename}"
+        signature_path = package_path + ".sig"
+        _run_privileged(
+            "install",
+            "-m0600",
+            "--",
+            "/dev/stdin",
+            package_path,
+            input_data=package,
+        )
+        _run_privileged(
+            "install",
+            "-m0600",
+            "--",
+            "/dev/stdin",
+            signature_path,
+            input_data=signature,
+        )
+        _check_stage(parent, name, identity)
+        yield package_path, signature_path
+    except BaseException:
+        failed = True
+        raise
+    finally:
+        try:
+            if identity is not None:
+                try:
+                    _check_stage(parent, name, identity)
+                    _run_privileged(
+                        "rm",
+                        "--force",
+                        "--",
+                        package_path,
+                        signature_path,
+                        authenticate=False,
+                    )
+                    _run_privileged("rmdir", "--", stage, authenticate=False)
+                except Exception as error:
+                    message = f"Could not remove private root package staging directory {stage}: {error}"
+                    if failed:
+                        print(message, file=sys.stderr)
+                    else:
+                        raise _StageCleanupError(message) from error
+        finally:
+            os.close(parent)
 
 
 def _require_fixed_tools():
     for name in (
         "gpg",
-        "pacman-conf",
+        "curl",
+        "install",
+        "mktemp",
+        "rm",
+        "rmdir",
         "sudo",
         "env",
         "timeout",
@@ -367,6 +519,7 @@ def _consent(signing_fingerprint, version):
         prompt = (
             f"Omarchy Air will install or upgrade its helper to {version} from:\n"
             f"{_package_url(version)}\n"
+            f"Required package SHA-256: {_RELEASE_DIGESTS[version][0]}\n"
             "Required system dependencies (including UFW, Avahi and "
             "pipewire-zeroconf) may also be installed.\n"
             f"Signing key: {signing_fingerprint}\n"
@@ -384,11 +537,20 @@ def _consent(signing_fingerprint, version):
         )
 
 
-def _sudo_env(command, *arguments):
-    if command not in {"pacman-key", "pacman"}:
+def _sudo_env(command, *arguments, authenticate=True):
+    if command not in {
+        "pacman-key",
+        "pacman",
+        "gpg",
+        "mktemp",
+        "install",
+        "rm",
+        "rmdir",
+    }:
         raise ValueError("Unsupported privileged helper command")
     return (
         "sudo",
+        *(("-n",) if not authenticate else ()),
         "--",
         fixed_executable("env"),
         "-i",
@@ -396,16 +558,16 @@ def _sudo_env(command, *arguments):
         "LC_ALL=C",
         fixed_executable("timeout"),
         "--signal=TERM",
-        "--kill-after=1s",
+        "--kill-after=30s",
         "600s",
         fixed_executable(command),
         *arguments,
     )
 
 
-def _run_privileged(command, *arguments, input_data=None):
+def _run_privileged(command, *arguments, input_data=None, authenticate=True):
     return run(
-        *_sudo_env(command, *arguments),
+        *_sudo_env(command, *arguments, authenticate=authenticate),
         timeout=_BOOTSTRAP_TIMEOUT,
         output_limit=_PACKAGE_OUTPUT_LIMIT,
         interactive=True,
@@ -439,7 +601,8 @@ def ensure_helper(sourcefd, owner, signing_fingerprint, version):
         raise ValueError("Public signing key data must be immutable bytes")
     _verify_public_key(key_data, signing_fingerprint)
     _require_fixed_tools()
-    _remote_signature_policy()
+    os.close(open_directory(_CACHE_ROOT, 0))
+    package, signature = _download_package(version)
     _consent(signing_fingerprint, version)
 
     try:
@@ -454,17 +617,26 @@ def ensure_helper(sourcefd, owner, signing_fingerprint, version):
         raise ValueError(
             "Could not locally trust the package signing key; no automatic key removal was attempted"
         ) from error
+    cleanup_error = None
     try:
-        _run_privileged(
-            "pacman",
-            "-U",
-            "--needed",
-            "--noconfirm",
-            _package_url(version),
-        )
+        with _staged_package(version, package, signature) as (
+            package_path,
+            signature_path,
+        ):
+            _verify_staged_signature(package_path, signature_path, signing_fingerprint)
+            _run_privileged(
+                "pacman",
+                "-U",
+                "--needed",
+                "--noconfirm",
+                package_path,
+            )
+    except _StageCleanupError as error:
+        cleanup_error = error
     except Exception as error:
         raise ValueError(
-            "Helper package installation failed; the signing key remains trusted in pacman and was not removed"
+            f"Helper package installation failed: {error}; "
+            "the signing key remains trusted in pacman and was not removed"
         ) from error
 
     try:
@@ -474,4 +646,8 @@ def ensure_helper(sourcefd, owner, signing_fingerprint, version):
             "Helper package completed but the installed helper failed protocol or safety validation; "
             "the signing key remains trusted in pacman and was not removed"
         ) from error
+    if cleanup_error is not None:
+        raise ValueError(
+            f"Helper is installed and validated, but staging cleanup failed: {cleanup_error}"
+        ) from cleanup_error
     return None

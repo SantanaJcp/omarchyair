@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "community.omarchyair",
   "name": "Omarchy Air",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": "Omarchy Air contributors",
   "description": "Discover AirPlay audio receivers in Omarchy's existing sound output selector using PipeWire.",
   "license": "MIT",

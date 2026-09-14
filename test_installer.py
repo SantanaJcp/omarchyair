@@ -68,7 +68,7 @@ class InstallerFilesystemTests(unittest.TestCase):
 
     def prepare_install_source(self):
         (self.source / "manifest.json").write_text(
-            json.dumps({"id": installer.PLUGIN_ID, "version": "0.3.0"})
+            json.dumps({"id": installer.PLUGIN_ID, "version": "0.3.1"})
         )
 
     def install_failure(self, host):
@@ -294,7 +294,7 @@ class InstallerFilesystemTests(unittest.TestCase):
             json.dumps(
                 {
                     "id": installer.PLUGIN_ID,
-                    "version": "0.3.0",
+                    "version": "0.3.1",
                 }
             )
         )

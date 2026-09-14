@@ -1,5 +1,6 @@
-"""Reject untrusted signing inputs and package policy before authorizing root work."""
+"""Reject substituted package bytes and untrusted signatures before installation."""
 
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -37,21 +38,116 @@ class BootstrapTrustTests(unittest.TestCase):
                 "D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18",
             )
 
-    def test_remote_unsigned_packages_are_refused(self):
-        result = subprocess.CompletedProcess(
-            (), 0, "PackageOptional\nPackageTrustedOnly\n", ""
-        )
-        with patch.object(bootstrap, "run", return_value=result):
-            with self.assertRaises(ValueError):
-                bootstrap._remote_signature_policy()
+    def test_replaced_release_payload_cannot_authorize_root_work(self):
+        with (
+            patch.object(bootstrap, "validate_helper", side_effect=FileNotFoundError),
+            patch.object(bootstrap, "_consent", return_value=None),
+            patch.object(bootstrap, "_download_asset", return_value=b"replacement"),
+            patch.object(
+                bootstrap,
+                "_run_privileged",
+                side_effect=SystemExit("Replacement reached privileged execution"),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            bootstrap.ensure_helper(
+                self.sourcefd,
+                os.getuid(),
+                "D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18",
+                next(iter(bootstrap._RELEASE_DIGESTS)),
+            )
 
-    def test_signed_but_untrusted_packages_are_refused(self):
-        result = subprocess.CompletedProcess(
-            (), 0, "PackageRequired\nPackageTrustAll\n", ""
+    def test_substituted_signature_cannot_reach_a_privileged_parser(self):
+        package = b"reviewed-package"
+        pins = (
+            hashlib.sha256(package).hexdigest(),
+            hashlib.sha256(b"reviewed-signature").hexdigest(),
         )
-        with patch.object(bootstrap, "run", return_value=result):
-            with self.assertRaises(ValueError):
-                bootstrap._remote_signature_policy()
+        with (
+            patch.object(bootstrap, "validate_helper", side_effect=FileNotFoundError),
+            patch.object(bootstrap, "_consent", return_value=None),
+            patch.object(bootstrap, "_RELEASE_DIGESTS", {"0.3.1": pins}),
+            patch.object(
+                bootstrap,
+                "_download_asset",
+                side_effect=[package, b"replacement-signature"],
+            ),
+            patch.object(
+                bootstrap,
+                "_run_privileged",
+                side_effect=SystemExit("Unverified signature reached root"),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            bootstrap.ensure_helper(
+                self.sourcefd,
+                os.getuid(),
+                "D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18",
+                "0.3.1",
+            )
+
+    def test_non_https_download_fails_with_a_controlled_text_error(self):
+        with self.assertRaises(ValueError):
+            bootstrap._download_asset("file:///dev/null", 1024)
+
+    def test_unpinned_version_cannot_download_a_package(self):
+        with (
+            patch.object(
+                bootstrap,
+                "_download_asset",
+                side_effect=AssertionError("Unpinned version reached download"),
+            ),
+            self.assertRaisesRegex(ValueError, "No pinned package"),
+        ):
+            bootstrap._download_package("99.0.0")
+
+    def test_untrusted_signature_is_rejected_even_when_cryptographically_valid(self):
+        fingerprint = "D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18"
+        status = (
+            f"[GNUPG:] GOODSIG {fingerprint[-16:]} Project\n"
+            f"[GNUPG:] VALIDSIG {fingerprint} 2026-09-13 1 0 4 0 22 8 00 {fingerprint}\n"
+            "[GNUPG:] TRUST_UNDEFINED 0 pgp\n"
+        )
+        with (
+            patch.object(
+                bootstrap,
+                "_run_privileged",
+                return_value=subprocess.CompletedProcess((), 0, status, ""),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            bootstrap._verify_staged_signature("package", "signature", fingerprint)
+
+    def test_trusted_signature_from_another_primary_key_is_rejected(self):
+        fingerprint = "D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18"
+        status = (
+            f"[GNUPG:] GOODSIG {'0' * 16} Other\n"
+            f"[GNUPG:] VALIDSIG {'0' * 40} 2026-09-13 1 0 4 0 22 8 00 {'0' * 40}\n"
+            "[GNUPG:] TRUST_FULLY 0 pgp\n"
+        )
+        with (
+            patch.object(
+                bootstrap,
+                "_run_privileged",
+                return_value=subprocess.CompletedProcess((), 0, status, ""),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            bootstrap._verify_staged_signature("package", "signature", fingerprint)
+
+    def test_user_replaceable_staging_parent_is_rejected_before_root_work(self):
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            patch.object(bootstrap, "_CACHE_ROOT", directory),
+            patch.object(
+                bootstrap,
+                "_run_privileged",
+                side_effect=AssertionError("Unprotected staging parent reached root"),
+            ),
+            self.assertRaises(ValueError),
+        ):
+            with bootstrap._staged_package("0.3.1", b"package", b"signature"):
+                self.fail("User-controlled stage was accepted")
 
     def test_user_owned_helper_tree_is_not_repaired_or_executed(self):
         with tempfile.TemporaryDirectory() as directory:

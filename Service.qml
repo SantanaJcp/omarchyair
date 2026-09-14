@@ -8,7 +8,7 @@ Item {
   property var lastExitCode: null
   property string lastError: ""
   property bool ready: false
-  readonly property string serviceVersion: "0.3.0"
+  readonly property string serviceVersion: "0.3.1"
 
   // The isolated supervisor owns discovery and its entire process group.
   // A lost shell lease tears down the group without restarting shared audio.

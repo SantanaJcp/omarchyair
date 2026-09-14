@@ -43,8 +43,12 @@ TOOLS = frozenset(
         "omarchyair-helper",
         "pacman-key",
         "gpg",
-        "pacman-conf",
         "timeout",
+        "curl",
+        "install",
+        "mktemp",
+        "rm",
+        "rmdir",
     )
 )
 DIRECTORY_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
@@ -424,13 +428,14 @@ def run(
     desktop=False,
     interactive=False,
     input_data=None,
+    text=True,
 ):
     if not 0 < output_limit <= 8 * 1048576:
         raise ValueError("Invalid command output budget")
     if input_data is not None and (
-        not isinstance(input_data, bytes) or len(input_data) > 4096
+        not isinstance(input_data, bytes) or len(input_data) > 1048576
     ):
-        raise ValueError("Command input must be immutable bytes, at most 4096 bytes")
+        raise ValueError("Command input must be immutable bytes, at most 1048576 bytes")
     child = ManagedProcess(
         args,
         timeout=timeout,
@@ -441,20 +446,40 @@ def run(
     buffers = {child.stdout: bytearray(), child.stderr: bytearray()}
     deadline = time.monotonic() + timeout
     count = 0
+    input_view = memoryview(input_data) if input_data else None
+    input_offset = 0
+    input_incomplete = False
     try:
-        if input_data:
-            child.send(input_data)
-        if not interactive or input_data is not None:
-            child.close_stdin()
         with selectors.DefaultSelector() as selector:
             for fd in buffers:
                 selector.register(fd, selectors.EVENT_READ)
+            if input_data:
+                selector.register(child.stdin, selectors.EVENT_WRITE)
+            elif not interactive or input_data is not None:
+                child.close_stdin()
             while selector.get_map() or child.poll() is None:
                 if time.monotonic() >= deadline:
                     raise ValueError(f"{args[0]} exceeded its {timeout}s deadline")
                 for key, _ in selector.select(
                     min(0.1, max(0, deadline - time.monotonic()))
                 ):
+                    if key.fd == child.stdin:
+                        try:
+                            written = os.write(child.stdin, input_view[input_offset:])
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        except BrokenPipeError:
+                            input_incomplete = True
+                            selector.unregister(child.stdin)
+                            child.close_stdin()
+                            continue
+                        if not written:
+                            continue
+                        input_offset += written
+                        if input_offset == len(input_data):
+                            selector.unregister(child.stdin)
+                            child.close_stdin()
+                        continue
                     chunk = os.read(key.fd, min(65536, output_limit + 1 - count))
                     if not chunk:
                         selector.unregister(key.fd)
@@ -463,16 +488,18 @@ def run(
                     if count > output_limit:
                         raise ValueError(f"{args[0]} exceeded its output budget")
                     buffers[key.fd].extend(chunk)
-        result = subprocess.CompletedProcess(
-            args,
-            child.returncode,
-            buffers[child.stdout].decode("utf-8", "replace"),
-            buffers[child.stderr].decode("utf-8", "replace"),
-        )
+        stdout = bytes(buffers[child.stdout])
+        stderr = bytes(buffers[child.stderr])
+        if text:
+            stdout = stdout.decode("utf-8", "replace")
+            stderr = stderr.decode("utf-8", "replace")
+        result = subprocess.CompletedProcess(args, child.returncode, stdout, stderr)
         if check and result.returncode:
             raise subprocess.CalledProcessError(
                 result.returncode, args, result.stdout, result.stderr
             )
+        if input_incomplete and result.returncode == 0:
+            raise ValueError(f"{args[0]} closed stdin before accepting complete input")
         return result
     finally:
         child.close()

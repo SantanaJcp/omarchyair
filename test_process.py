@@ -1,5 +1,6 @@
 """Exercise real subprocesses; no privileged commands or audio changes."""
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -99,6 +100,64 @@ class ProcessBoundaryTests(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 5)
         self.assert_stopped(self.wait_pid(pidfile))
 
+    def test_large_input_is_streamed_while_slow_reader_emits_output(self):
+        payload = bytes(range(256)) * 512
+        code = (
+            "import hashlib,os,time; digest=hashlib.sha256()\n"
+            "while True:\n"
+            " chunk=os.read(0,1024)\n"
+            " if not chunk: break\n"
+            " digest.update(chunk)\n"
+            ' os.write(1,b"o"*len(chunk))\n'
+            " time.sleep(0.002)\n"
+            "os.write(2,digest.hexdigest().encode())"
+        )
+        result = air.run("python3", "-I", "-c", code, input_data=payload, timeout=5)
+        self.assertEqual(result.stdout, "o" * len(payload))
+        self.assertEqual(result.stderr, hashlib.sha256(payload).hexdigest())
+
+    def test_binary_output_is_preserved_when_text_is_disabled(self):
+        stdout = bytes(range(256)) + b"\x00\xff"
+        stderr = b"\xff\x00diagnostic\x80"
+        code = f"import os; os.write(1,{stdout!r}); os.write(2,{stderr!r})"
+        result = air.run("python3", "-I", "-c", code, text=False)
+        self.assertEqual(result.stdout, stdout)
+        self.assertEqual(result.stderr, stderr)
+
+    def test_stalled_stdin_reader_obeys_deadline(self):
+        pidfile = self.directory / "stdin-stall"
+        code = (
+            f'import os,time; open({str(pidfile)!r},"w").write(str(os.getpid())); '
+            "time.sleep(60)"
+        )
+        started = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "deadline"):
+            air.run(
+                "python3",
+                "-I",
+                "-c",
+                code,
+                input_data=b"x" * 1048576,
+                timeout=0.4,
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assert_stopped(self.wait_pid(pidfile))
+
+    def test_premature_stdin_close_preserves_failure_and_rejects_success(self):
+        payload = b"x" * 1048576
+        failing = (
+            'import os,sys; os.close(0); print("input refused",file=sys.stderr); '
+            "sys.exit(7)"
+        )
+        with self.assertRaises(subprocess.CalledProcessError) as failure:
+            air.run("python3", "-I", "-c", failing, input_data=payload)
+        self.assertEqual(failure.exception.returncode, 7)
+        self.assertEqual(failure.exception.stderr.strip(), "input refused")
+
+        successful = "import os; os.close(0)"
+        with self.assertRaisesRegex(ValueError, "before accepting complete input"):
+            air.run("python3", "-I", "-c", successful, input_data=payload)
+
     def test_successful_leader_does_not_leave_descendants_holding_pipes(self):
         pidfile = self.directory / "descendant"
         code = (
@@ -158,17 +217,19 @@ class ProcessBoundaryTests(unittest.TestCase):
         pid, terminal = pty.fork()
         if pid == 0:
             try:
+                payload = b"bootstrap-payload-" * 8192
+                expected = hashlib.sha256(payload).hexdigest()
                 result = air.run(
                     "python3",
                     "-I",
                     "-c",
-                    'import os,sys; fd=os.open("/dev/tty",os.O_RDWR); '
+                    'import hashlib,os,sys; fd=os.open("/dev/tty",os.O_RDWR); '
                     "assert os.tcgetpgrp(fd)==os.getpgrp(); "
-                    'assert sys.stdin.buffer.read()==b"bootstrap-payload"; '
+                    f"assert hashlib.sha256(sys.stdin.buffer.read()).hexdigest()=={expected!r}; "
                     'print("foreground-auth")',
                     interactive=True,
-                    input_data=b"bootstrap-payload",
-                    timeout=3,
+                    input_data=payload,
+                    timeout=5,
                 )
                 assert result.stdout.strip() == "foreground-auth"
                 assert os.tcgetpgrp(0) == os.getpgrp()
@@ -179,7 +240,7 @@ class ProcessBoundaryTests(unittest.TestCase):
         outcome = None
         diagnostic = bytearray()
         try:
-            deadline = time.monotonic() + 8
+            deadline = time.monotonic() + 10
             while time.monotonic() < deadline:
                 if select.select([terminal], [], [], 0.05)[0]:
                     try:

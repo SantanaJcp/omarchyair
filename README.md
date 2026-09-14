@@ -4,8 +4,8 @@ Omarchy Air is an open-source AirPlay audio output integration for Omarchy.
 Receivers appear in Omarchy's **existing audio output selector**; this is not a
 replacement audio panel, Sonos controller, or new AirPlay implementation.
 PipeWire provides discovery, authentication, audio transport, and volume
-control. Release 0.3.0 keeps that native audio path while moving narrowly
-scoped system operations into a separately installed, signed helper.
+control. Release 0.3.1 keeps that native audio path and uses a separately
+installed, signed helper for narrowly scoped system operations.
 
 ## Operating model
 
@@ -76,22 +76,49 @@ implications. The release key and fixed package target are:
 - key UID: `Omarchy Air releases <codingsantana@gmail.com>`
 - key expiry: 2028-09-11
 - fixed package URL:
-  `https://github.com/SantanaJcp/omarchyair/releases/download/v0.3.0/omarchyair-helper-0.3.0-1-any.pkg.tar.zst`
+  `https://github.com/SantanaJcp/omarchyair/releases/download/v0.3.1/omarchyair-helper-0.3.1-1-any.pkg.tar.zst`
 
-The public key is bundled as `signing-key.asc` in the reviewed plugin payload.
-After confirmation, the frontend passes that key by standard input to the
-fixed root `pacman-key` operation, locally trusts only the displayed
-fingerprint, and asks root `pacman` to download and install the signed package
-from the fixed HTTPS release URL. It does not accept a key or package path
-from the user, copy a local package, or execute a helper from the checkout.
+The bundled `signing-key.asc` is checked against the embedded fingerprint as
+the normal user before consent. After confirmation, the frontend passes those
+same key bytes by standard input to the fixed root `pacman-key` operation and
+locally trusts that key. It does not accept a key or package path from the user,
+copy a caller-controlled local package, or execute a helper from the checkout.
+
+For every supported helper version, the bootstrap pins its versioned release
+URL and expected SHA-256 digests for both package and detached signature.
+It downloads both assets before asking for administrative consent, as the
+normal desktop user, with curl configuration files disabled,
+HTTPS required across redirects, at most three redirects, a 10-second connect
+timeout, and a 60-second total budget for each transfer. The package is limited
+to 1 MiB and the signature to 4 KiB. Both SHA-256 digests must match their
+per-version pins before any privilege escalation or key-trust mutation.
+
+The already downloaded bytes are transferred unchanged through standard input
+to fixed root `install -m0600 /dev/stdin <staged-path>` commands; the bootstrap
+never asks root to reopen a normal-user pathname. A native root `mktemp` creates
+a new exclusive, root-owned 0700 `omarchyair.XXXXXXXXXXXX` staging directory
+under `/var/cache`, and `install` writes the package and signature there. Root
+then runs `/usr/bin/gpg --no-options --batch --homedir /etc/pacman.d/gnupg
+--no-auto-key-retrieve --status-fd 1 --verify <signature> <package>` and accepts
+exactly one `GOODSIG` and one `VALIDSIG` for the expected primary fingerprint,
+with `TRUST_FULLY` or `TRUST_ULTIMATE` and no expired/revoked signature status.
+This staged verification is mandatory and independent of pacman's file-transfer
+policy: it relies on neither
+`RemoteFileSigLevel` nor a weaker `LocalFileSigLevel`, including `Optional`.
+Only after it succeeds does `pacman -U` receive the protected root-owned
+package path.
+Completed operations remove their staging files and directory. Cleanup does
+not prompt again for credentials. Interruption or lost sudo authorization may
+leave a private root-owned staging directory; cleanup failures report its path
+rather than deleting unrelated cache entries.
+If cleanup fails after pacman succeeds, the bootstrap still validates the
+installed helper and reports installation and leftover staging separately.
+
 Before using an installed helper, the frontend requires its protocol response
-to identify API 1 and helper version 0.3.0. A missing or older helper requires
+to identify API 1 and helper version 0.3.1. A missing or older helper requires
 the signed bootstrap. A newer helper is never downgraded automatically:
-update the plugin checkout instead.
-The URL is the release artifact selected for 0.3.0; do not replace it with a
-mirror or an unverified local file. The package manager must enforce its
-effective remote-file signature policy (`require` plus `trusted`); the
-bootstrap never bypasses signature checking.
+update the plugin checkout instead. The URL and SHA-256 pin select the immutable
+0.3.1 release artifact; do not substitute a mirror or local file.
 
 This bootstrap is a real trust decision. The signing key is trusted in the
 system pacman keyring, so it authorizes installation of any package signed by
@@ -160,7 +187,7 @@ other repository command, with `sudo` or `pkexec`.
 
 ### Upgrade from an earlier release
 
-Use a separate, reviewed checkout of the 0.3.0 release. First select a local
+Use a separate, reviewed checkout of the 0.3.1 release. First select a local
 speaker or headphones in Omarchy's audio panel. Then, from the new checkout,
 run this sequence in order:
 
@@ -389,16 +416,16 @@ Only the installed, root-owned helper runs plugin-authored code as root.
 The bootstrap also invokes fixed privileged system package tools. A compromised
 signing key or malicious signed package could compromise the entire system;
 the helper's narrow API is not a sandbox for its author or signing key.
-Bootstrap requires explicit consent and sudo authentication, uses a fixed package
-URL, and does not grant root access to repository or plugin files. No
-marketplace approval or security certification is implied.
+Bootstrap requires explicit consent and sudo authentication, uses a fixed
+per-version package URL and SHA-256, and does not grant root access to repository
+or plugin files. No marketplace approval or security certification is implied.
 
-Privileged package/key commands run under a root-side 600-second system
-`timeout`, with a 900-second caller budget. Network operations have a
-150-second root-side limit and a 180-second caller budget. The root-side
-timeouts escalate after one second independently of the unprivileged caller.
-Ordinary subprocesses retain their 30-second deadlines and 1 MiB output
-budgets; bootstrap output is limited to 8 MiB.
+The privileged package transaction runs under a root-side 600-second system
+`timeout`, with a 30-second TERM-to-KILL grace period and a 900-second caller
+budget. Network operations have a 150-second root-side limit, a one-second
+TERM-to-KILL grace period, and a 180-second caller budget. Ordinary subprocesses
+retain their 30-second deadlines and 1 MiB output budgets; bootstrap output is
+limited to 8 MiB.
 
 ## Compatibility and verification
 
@@ -448,12 +475,13 @@ universal AirPlay or AirPlay 2 compatibility claim is made.
 
 Build as a normal user from reviewed sources. Advance the manifest, compiled
 QML version, helper protocol version string and `PKGBUILD` package version
-together for each release. Regenerate and review the source hashes with
+together for each release. Regenerate and review the final source hashes with
 `makepkg --geninteg`; do not use skipped checksums. Keep build output outside
 the plugin checkout because makepkg's source symlinks are not valid plugin
 payload entries.
 
-With the protected signing key configured in your private `GNUPGHOME`:
+With the protected signing key configured in your private `GNUPGHOME`, first
+finish the source hashes, then build and sign the final package:
 
 ```sh
 mkdir -p "$HOME/.cache/omarchyair-build" "$HOME/.cache/omarchyair-dist"
@@ -462,11 +490,17 @@ PKGDEST="$HOME/.cache/omarchyair-dist" \
 makepkg --cleanbuild --sign --key D1E431E8B1F91F6A6C28A0A2B78190C1F45FCB18
 ```
 
+Compute the SHA-256 of both final immutable assets, package and detached `.sig`,
+and embed those exact digests in the bootstrap's entry for the new version.
+Never guess them or calculate them from an earlier build/signature. Review
+those pins, then commit and tag the release. This order has no digest cycle
+because the bootstrap is not a package source.
+
 Publish the reviewed version tag, package, detached `.sig`, and public
 `signing-key.asc` through this repository's GitHub Release. The frontend pins
-that release's version and `pkgrel=1` asset name. Never replace a published
-release artifact; publish a new version for corrections. Never commit or
-upload the private signing key or its revocation certificate. Keep protected
+that release's version, `pkgrel=1` asset name, and both SHA-256 digests. Never replace a
+published release artifact; publish a new version for corrections. Never commit
+or upload the private signing key or its revocation certificate. Keep protected
 offline backups; package signing must remain under the maintainer's control.
 
 ## License

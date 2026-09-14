@@ -27,7 +27,7 @@ from omarchyair_runtime import (
 )
 
 
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 API_VERSION = 1
 
 STATE_ROOT = Path("/var/lib/omarchyair")
